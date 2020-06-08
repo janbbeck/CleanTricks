@@ -33,11 +33,19 @@ def sorted_instructions(binview):
 
 
 def sliding_window(iterable, window_size):
-    iterable = iter(iterable) # Thanks for nothing, Python 2
-    window = [next(iterable) for _ in range(window_size)]
+    iterable = iter(iterable)
+    window = None
+    try:
+        window = [next(iterable) for _ in range(window_size)]
+    except StopIteration as err:
+        raise ValueError("Window is smaller than generator size")
+
     while True:
+      try:
         yield window
         window = window[1:] + [next(iterable)]
+      except StopIteration:
+        break
 
 
 def oper(string, arg1, arg2):
