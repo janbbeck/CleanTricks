@@ -1,6 +1,157 @@
 from binaryninja import *
 from operator import itemgetter
 import time
+from collections import namedtuple
+
+Instruction = namedtuple("Instruction", ["tokens", "address"])
+
+KNOWN_OPER = ["xor", "add", "sub", "or", "and"]
+
+def instr(tup):
+    tokens, addr = tup
+    # TODO Perhaps instead of doing this we can leave them as
+    # InstructionTextToken objects and just utilize the API better?...
+    tokens = [x.text.lstrip().rstrip() for x in tokens]
+    tokens = [x for x in tokens if x != ""]
+    return Instruction(tokens=tokens, address=addr)
+
+
+def sorted_instructions(binview):
+    """
+    Return a sorted list of the instructions in the current viewport.
+    """
+    addrs = []
+    instructions = []
+    for ii in binview.instructions:
+        if ii[1] not in addrs:
+            instructions.append(instr(ii))
+            addrs.append(ii[1])
+
+    del addrs
+    instructions.sort(key=lambda x: x.address)
+    return instructions
+
+
+def sliding_window(iterable, window_size):
+    iterable = iter(iterable)
+    window = None
+    try:
+        window = [next(iterable) for _ in range(window_size)]
+    except StopIteration as err:
+        raise ValueError("Window is smaller than generator size")
+
+    while True:
+      try:
+        yield window
+        window = window[1:] + [next(iterable)]
+      except StopIteration:
+        break
+
+
+def oper(string, arg1, arg2):
+    if string == "xor":
+        return arg1 ^ arg2
+    if string == "add":
+        return arg1 + arg2
+    if string == "sub":
+        return arg1 - arg2
+    if string == "or":
+        return arg1 | arg2
+    if string == "and":
+        return arg1 & arg2
+
+
+def clean_tricks_oper_before_jns(bv):
+    # Pattern we are trying to get rid of:
+    #
+    #     mov     eax, 0xea3e6566
+    #     xor     eax, 0x5f69faeb  {0xb5579f8d}
+    #     jns     0x4007b6         {0x0}         Will never branch!
+
+    # NOTE: How this works: the MOV and XOR instructions are arranged so that
+    # the operands produce a signed number (MSB is 1). Thus the branch is
+    # never taken (SF=0).
+
+    start = time.time()
+    instructions = sorted_instructions(bv)
+
+    for triplet in sliding_window(instructions, 3):
+        matches = (
+            "jns" in triplet[2].tokens and
+            triplet[1].tokens[0] in KNOWN_OPER and
+            "mov" in triplet[0].tokens and
+
+            # Registers must match and be a 32bit register
+            triplet[0].tokens[1] == triplet[1].tokens[1] and triplet[0].tokens[1].startswith("e")
+        )
+
+        if not matches:
+            continue
+
+        value = oper(
+            triplet[1].tokens[0],
+            int(triplet[1].tokens[3], 16),
+            int(triplet[0].tokens[3], 16)
+        )
+        never_branch = value & 0x800000000 != 0
+        if never_branch:
+            bv.never_branch(triplet[2].address)
+        else:
+            bv.never_branch(triplet[2].address)
+
+        msg = "[CleanTricks] Cutting out useless branch at 0x{0.address:x}".format(triplet[2])
+        binaryninja.log_info(msg)
+
+    msg = "[CleanTricks::OperBeforeJNS] Done! Finished in {} seconds.".format(time.time() - start)
+    binaryninja.log_info(msg)
+
+
+def clean_tricks_oper_before_jne(bv):
+    # Pattern we are trying to get rid of:
+    #
+    #     mov     eax, 0x2e4ef210
+    #     add     eax, 0xd1b10df0  {0x0}
+    #     jne     0x40087e         {0x0}   Will always branch!
+
+    # NOTE: How this works: the MOV and ADD instructions are arranged perfectly
+    # so that the result of the add is 0x100000000. Since this is larger than
+    # the max 32-bit number, EAX is set to 0, ZF=0 and CF=1. JNE jumps if ZF=0
+    # so the branch is always taken. In the opposite case, if the two numbers
+    # add to anything not zero, ZF=1 and the JNE is never taken.
+
+    start = time.time()
+    instructions = sorted_instructions(bv)
+
+    for triplet in sliding_window(instructions, 3):
+        matches = (
+            "jne" in triplet[2].tokens and
+            triplet[1].tokens[0] in KNOWN_OPER and
+            "mov" in triplet[0].tokens and
+
+            # Registers must match and be 32bit
+            triplet[0].tokens[1] == triplet[1].tokens[1] and triplet[1].tokens[1].startswith("e")
+        )
+
+        if not matches:
+            continue
+
+        value = oper(
+            triplet[1].tokens[0],
+            int(triplet[1].tokens[3], 16),
+            int(triplet[0].tokens[3], 16)
+        )
+        always_branch = (value & 0xFFFFFFFF == 0)
+        if always_branch:
+            bv.always_branch(triplet[2].address)
+        else:
+            bv.never_branch(triplet[2].address)
+
+        msg = "[CleanTricks] Cutting out useless branch at 0x{0.address:x}".format(triplet[2])
+        binaryninja.log_info(msg)
+
+    msg = "[CleanTricks::OperBeforeJNE] Done! Finished in {} seconds.".format(time.time() - start)
+    binaryninja.log_info(msg)
+
 
 def clean_tricks_template(bv):
          # empty template to play with
@@ -16,6 +167,7 @@ def clean_tricks_template(bv):
          end = time.time()
          binaryninja.log_info(repr(end-start))
          binaryninja.log_info("Done. Finished in {} seconds.".format(end-start))
+
 
 def clean_tricks_push_xor_je_pop(bv):
          #push REG, xor REG,REG, je, pop REG
@@ -59,6 +211,7 @@ def clean_tricks_push_xor_je_pop(bv):
          binaryninja.log_info("Done. Finished in {} seconds.".format(end-start))
          binaryninja.log_info("{} patches performed.".format(patchCount))
 
+
 def clean_tricks_jmp_inc_dec(bv):
          # jmp (overlaps inc instruction) -> inc REG -> dec REG
          start = time.time()
@@ -91,6 +244,7 @@ def clean_tricks_jmp_inc_dec(bv):
          binaryninja.log_info("Done. Finished in {} seconds.".format(end-start))
          binaryninja.log_info("{} patches performed.".format(patchCount))
 
+
 def clean_tricks_mov_xor_je(bv):
          # mov REG, CODE -> xor REG,REG -> je CODE
          # careful! xor REG,REG may be legitimate...
@@ -120,6 +274,7 @@ def clean_tricks_mov_xor_je(bv):
          binaryninja.log_info(repr(end-start))
          binaryninja.log_info("Done. Finished in {} seconds.".format(end-start))
          binaryninja.log_info("{} patches performed.".format(patchCount))
+
 
 def clean_tricks_mov_xor_je_sorted(bv):
          # mov REG, CODE -> xor REG,REG -> je CODE
@@ -172,6 +327,7 @@ def clean_tricks_mov_xor_je_sorted(bv):
          binaryninja.log_info("Done. Finished in {} seconds.".format(end-start))
          binaryninja.log_info("{} patches performed.".format(patchCount))
 
+
 def clean_tricks_inc_dec(bv):
          # jmp (overlaps inc instruction) -> inc REG -> dec REG
          start = time.time()
@@ -193,6 +349,7 @@ def clean_tricks_inc_dec(bv):
          end = time.time()
          binaryninja.log_info("Done. Finished in {} seconds.".format(end-start))
          binaryninja.log_info("{} patches performed.".format(patchCount))
+
 
 def clean_tricks_xor_je(bv):
          # xor REG,REG -> je ADDR
@@ -225,6 +382,7 @@ def clean_tricks_xor_je(bv):
          binaryninja.log_info(repr(end-start))
          binaryninja.log_info("Done. Finished in {} seconds.".format(end-start))
          binaryninja.log_info("{} patches performed.".format(patchCount))
+
 
 def clean_tricks_je_jne(bv):
          # je ADDR -> jne ADDR
@@ -265,6 +423,7 @@ def clean_tricks_je_jne(bv):
          binaryninja.log_info("Done. Finished in {} seconds.".format(end-start))
          binaryninja.log_info("{} patches performed.".format(patchCount))
 
+
 def clean_tricks_all(bv):
      clean_tricks_je_jne(bv)
      clean_tricks_push_xor_je_pop(bv)
@@ -273,15 +432,62 @@ def clean_tricks_all(bv):
      clean_tricks_mov_xor_je_sorted(bv)
      clean_tricks_inc_dec(bv)
      clean_tricks_xor_je(bv)
+     clean_tricks_oper_before_jne(bv)
+     clean_tricks_oper_before_jns(bv)
 
 
-PluginCommand.register("Clean Tricks\\0 - Empty template", "Empty template to experiment with", clean_tricks_template)
-PluginCommand.register("Clean Tricks\\1 - Patch 'je ADDR-> jne ADDR' (forward)"         , "Patches all 'je ADDR -> jne ADDR' to jmp", clean_tricks_je_jne) 
-PluginCommand.register("Clean Tricks\\2 - Patch 'push REG, xor REG,REG, je, pop REG'"         , "Patches all 'push REG, xor REG,REG, je, pop REG' to nop", clean_tricks_push_xor_je_pop) 
-PluginCommand.register("Clean Tricks\\3 - Patch 'jmp -> inc REG -> dec REG' (jmp,inc overlap)", "Patches all 'jmp - > inc REG -> dec REG' to nops", clean_tricks_jmp_inc_dec)
-PluginCommand.register("Clean Tricks\\4 - Patch 'mov REG -> xor REG,REG -> je'" , "Patches all 'mov REG -> xor REG,REG -> je'  to 'nop'" , clean_tricks_mov_xor_je) 
-PluginCommand.register("Clean Tricks\\5 - Patch 'mov REG -> xor REG,REG -> je' (sort instructions)" , "Patches all 'mov REG -> xor REG,REG -> je'  to 'nop' using a sorted list for the instructions" , clean_tricks_mov_xor_je_sorted) 
-PluginCommand.register("Clean Tricks\\6 - Patch 'inc REG -> dec REG'", "Patches all 'inc REG -> dec REG' to nops", clean_tricks_inc_dec)
-PluginCommand.register("Clean Tricks\\7 - Patch 'xor REG,REG -> je ADDR'"         , "Patches all 'XOR REG,REG -> je ADDR' to jmp", clean_tricks_xor_je) 
-PluginCommand.register("Clean Tricks\\8 - Patch all"         , "Run all tricks", clean_tricks_all) 
-
+PluginCommand.register(
+    "Clean Tricks\\00 - Empty template",
+    "Empty template to experiment with",
+    clean_tricks_template
+)
+PluginCommand.register(
+    "Clean Tricks\\01 - Patch 'je ADDR-> jne ADDR' (forward)",
+    "Patches all 'je ADDR -> jne ADDR' to jmp",
+    clean_tricks_je_jne
+) 
+PluginCommand.register(
+    "Clean Tricks\\02 - Patch 'push REG, xor REG,REG, je, pop REG'",
+    "Patches all 'push REG, xor REG,REG, je, pop REG' to nop",
+    clean_tricks_push_xor_je_pop
+) 
+PluginCommand.register(
+    "Clean Tricks\\03 - Patch 'jmp -> inc REG -> dec REG' (jmp,inc overlap)",
+    "Patches all 'jmp - > inc REG -> dec REG' to nops",
+    clean_tricks_jmp_inc_dec
+)
+PluginCommand.register(
+    "Clean Tricks\\04 - Patch 'mov REG -> xor REG,REG -> je'",
+    "Patches all 'mov REG -> xor REG,REG -> je' to 'nop'" ,
+    clean_tricks_mov_xor_je
+)
+PluginCommand.register(
+    "Clean Tricks\\05 - Patch 'mov REG -> xor REG,REG -> je' (sort instructions)",
+    "Patches all 'mov REG -> xor REG,REG -> je'  to 'nop' using a sorted list for the instructions",
+    clean_tricks_mov_xor_je_sorted
+) 
+PluginCommand.register(
+    "Clean Tricks\\06 - Patch 'inc REG -> dec REG'",
+    "Patches all 'inc REG -> dec REG' to nops",
+    clean_tricks_inc_dec
+)
+PluginCommand.register(
+    "Clean Tricks\\07 - Patch 'xor REG,REG -> je ADDR'",
+    "Patches all 'XOR REG,REG -> je ADDR' to jmp",
+    clean_tricks_xor_je
+)
+PluginCommand.register(
+    "Clean Tricks\\08 - Patch deterministic JNE",
+    "Patch 'mov REG,A -> add REG,B -> jne ADDR' and similar",
+    clean_tricks_oper_before_jne
+)
+PluginCommand.register(
+    "Clean Tricks\\09 - Patch deterministic JNS",
+    "Patch 'mov REG,A -> add REG,B -> jns ADDR' and similar",
+    clean_tricks_oper_before_jns
+)
+PluginCommand.register(
+    "Clean Tricks\\10 - Patch all",
+    "Run all tricks",
+    clean_tricks_all
+)
